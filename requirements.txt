@@ -1,13 +1,28 @@
-# ฐาน (พอให้ /health เขียว + เซิร์ฟเวอร์รัน) — เบา ลงเร็ว
+# ===== ลงครั้งเดียวครบทุกโหนด =====  pip install -r requirements.txt
+# ฐาน (เซิร์ฟเวอร์)
 fastapi
 uvicorn
 pillow
-# torch มากับ template RunPod PyTorch อยู่แล้ว ไม่ต้องลงซ้ำ
+# พื้นหลัง (Flux Kontext) + วีดีโอ (Wan2.2) + อ่านภาพ (Qwen2-VL)
+diffusers>=0.32.0
+transformers>=4.49.0
+accelerate
+sentencepiece
+protobuf
+qwen-vl-utils
+# ความคม (Real-ESRGAN)
+realesrgan
+basicsr
+# วีดีโอ export
+imageio
+imageio-ffmpeg
+# เสียง (F5-TTS)
+soundfile
+# torch มากับ template RunPod PyTorch แล้ว — ไม่ต้องลง
 #
-# โมเดลหนักลงตอนใช้จริง (per-node) — ดู README:
-#   พื้นหลัง:  diffusers transformers accelerate
-#   ความคม:   realesrgan
-#   วีดีโอ:    diffusers (Wan2.2) + ffmpeg
-#   เสียง:     f5-tts soundfile
-#   อ่านภาพ:   transformers accelerate qwen-vl-utils
-#   ใส่ชุด:    (clone CatVTON repo + ckpt)
+# === ต้องทำมือครั้งเดียว (ลง requirements ไม่ครอบ) ===
+# 1) Flux Kontext gated:  huggingface-cli login   แล้วกดยอมรับ license ที่
+#    https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev
+# 2) เสียง F5-TTS:        pip install f5-tts   + วางไฟล์เสียงต้นแบบ ./voice/ref.wav
+# 3) ใส่ชุด CatVTON:      git clone https://github.com/Zheng-Chong/CatVTON  (+ wrapper - รออัปจากผม)
+#    *ระหว่างยังไม่เสร็จ โหนดเหล่านี้ใช้ fal อัตโนมัติ (ลูปไม่สะดุด)*
