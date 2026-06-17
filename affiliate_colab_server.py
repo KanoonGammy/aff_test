@@ -1,27 +1,27 @@
-# server.py - Khanun affiliate inference server (RunPod) - v2 robust
+# server.py - Khanun affiliate inference (RunPod) - v3
+# fixes: persist on /workspace (survives Stop) + /warmup endpoint (preload model inside Pod, avoids 100s proxy 524)
 import base64, io, os, time, uuid, gc
 import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
 from PIL import Image, ImageFilter
 
-ROOT = os.getcwd()
-OUT = os.environ.get("OUT_DIR", os.path.join(ROOT, "outputs"))
-MODELS_ROOT = os.environ.get("MODELS_ROOT", os.path.join(ROOT, "models"))
+PERSIST = "/workspace" if os.path.isdir("/workspace") else os.getcwd()   # /workspace = ถาวร (ไม่โดน Stop ล้าง)
+OUT = os.environ.get("OUT_DIR", os.path.join(PERSIST, "aff_outputs"))
+MODELS_ROOT = os.environ.get("MODELS_ROOT", os.path.join(PERSIST, "aff_models"))
 os.makedirs(OUT, exist_ok=True); os.makedirs(MODELS_ROOT, exist_ok=True)
 os.environ.setdefault("HF_HOME", os.path.join(MODELS_ROOT, "_hf"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 GPU_PROFILE = os.environ.get("GPU_PROFILE", "a100")
 
-app = FastAPI(title="Khanun Affiliate Inference v2")
+app = FastAPI(title="Khanun Affiliate Inference v3")
 
 def _safe(name):
     return "".join(c for c in (name or "") if c.isalnum() or c in "-_ ")[:40].strip().replace(" ", "_") or "job"
 def _decode(s):
     if s.startswith("data:"):
-        s = s.split(",", 1)[1]
-        return Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
+        s = s.split(",", 1)[1]; return Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
     import urllib.request
     with urllib.request.urlopen(s, timeout=60) as r:
         return Image.open(io.BytesIO(r.read())).convert("RGB")
@@ -45,7 +45,6 @@ def _need(name, loader):
         _free(); print("[load]", name, flush=True); _L["obj"] = loader(); _L["name"] = name
     return _L["obj"]
 
-# ---------- loaders ----------
 def _load_kontext():
     from diffusers import FluxKontextPipeline
     p = FluxKontextPipeline.from_pretrained("black-forest-labs/FLUX.1-Kontext-dev", torch_dtype=DTYPE)
@@ -55,7 +54,6 @@ def _load_wan():
     p = WanImageToVideoPipeline.from_pretrained("Wan-AI/Wan2.2-I2V-A14B-Diffusers", torch_dtype=DTYPE)
     p.enable_model_cpu_offload(); return p
 def _load_upscaler():
-    # Real-ESRGAN (xinntao). ถ้าพังจะ fallback เป็น Lanczos ที่ handler
     from realesrgan import RealESRGANer
     from basicsr.archs.rrdbnet_arch import RRDBNet
     import urllib.request
@@ -72,7 +70,6 @@ def _load_f5():
     from f5_tts.api import F5TTS
     return F5TTS()
 
-# ---------- handlers ----------
 def h_kontext(req, ip):
     imgs = ip.get("images") or ([ip["image_url"]] if ip.get("image_url") else [])
     out = _need("kontext", _load_kontext)(image=_decode(imgs[0]), prompt=ip.get("prompt", ""),
@@ -82,12 +79,11 @@ def h_upscale(req, ip):
     img = _decode(ip["image_url"]); f = int(ip.get("upscale_factor", 2))
     try:
         import numpy as np
-        up = _need("upscale", _load_upscaler)
-        arr, _ = up.enhance(np.array(img)[:, :, ::-1], outscale=f)   # PIL RGB -> BGR
-        out = Image.fromarray(arr[:, :, ::-1])                       # BGR -> RGB
+        arr, _ = _need("upscale", _load_upscaler).enhance(np.array(img)[:, :, ::-1], outscale=f)
+        out = Image.fromarray(arr[:, :, ::-1])
     except Exception as e:
-        print("[upscale -> lanczos fallback]", str(e)[:120], flush=True)
-        out = img.resize((img.width * f, img.height * f), Image.LANCZOS).filter(ImageFilter.UnsharpMask(radius=2, percent=130))
+        print("[upscale -> lanczos]", str(e)[:120], flush=True)
+        out = img.resize((img.width * f, img.height * f), Image.LANCZOS).filter(ImageFilter.UnsharpMask(2, 130))
     return {"images": [{"url": _url(req, _save_img(out, ip, "hq"))}]}
 def h_video(req, ip):
     src = _decode(ip.get("image") or ip.get("image_url")); secs = int(float(ip.get("duration", 10)))
@@ -98,7 +94,7 @@ def h_video(req, ip):
     return {"video": {"url": _url(req, os.path.relpath(os.path.join(d, fn), OUT))}}
 def h_tts(req, ip):
     dd = ip.get("inputs", ip)
-    wav, sr, _ = _need("f5", _load_f5).infer(ref_file=os.environ.get("F5_REF_AUDIO", os.path.join(ROOT, "voice/ref.wav")),
+    wav, sr, _ = _need("f5", _load_f5).infer(ref_file=os.environ.get("F5_REF_AUDIO", os.path.join(PERSIST, "voice/ref.wav")),
         ref_text=os.environ.get("F5_REF_TEXT", ""), gen_text=dd.get("text", ""))
     import soundfile as sf
     b = io.BytesIO(); sf.write(b, wav, sr, format="WAV")
@@ -113,12 +109,14 @@ def h_vision(req, ip):
     ans = pr.batch_decode(o[:, b.input_ids.shape[1]:], skip_special_tokens=True)[0]
     return {"output": ans, "outputs": [ans]}
 def h_vton(req, ip):
-    raise RuntimeError("CatVTON ยังไม่ติดตั้ง wrapper (โหนดใส่ชุดให้ใช้ fal ไปก่อน)")
+    raise RuntimeError("CatVTON wrapper ยังไม่ติดตั้ง — โหนดใส่ชุดใช้ fal ไปก่อน")
 
 ROUTER = {"kolors-virtual-try-on": h_vton, "fashn/tryon": h_vton, "idm": h_vton,
     "flux-pro/kontext": h_kontext, "kontext": h_kontext, "clarity-upscaler": h_upscale, "upscaler": h_upscale,
     "image-to-video": h_video, "wan": h_video, "kling-video": h_video, "hailuo": h_video,
     "tts": h_tts, "elevenlabs": h_tts, "vision": h_vision, "any-llm": h_vision}
+WARM = {"bg": ("kontext", _load_kontext), "video": ("wan", _load_wan), "upscale": ("upscale", _load_upscaler),
+    "vision": ("qwen", _load_qwen), "voice": ("f5", _load_f5)}
 
 @app.get("/health")
 def health():
@@ -126,7 +124,18 @@ def health():
     if DEVICE == "cuda":
         free, total = torch.cuda.mem_get_info(); used = round((total - free) / 1e9, 1)
     return {"ok": True, "device": DEVICE, "loaded": _L["name"], "profile": GPU_PROFILE,
-        "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used, "out": OUT}
+        "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used,
+        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT}
+
+@app.post("/warmup")
+async def warmup(req: Request):
+    body = await req.json(); node = body.get("node", "")
+    if node not in WARM: return JSONResponse({"ok": False, "error": "warmup node: bg|video|upscale|vision|voice"}, 400)
+    name, loader = WARM[node]
+    try:
+        _need(name, loader); return {"ok": True, "loaded": name, "msg": "model in VRAM — app /infer will be fast now"}
+    except Exception as e:
+        import traceback; traceback.print_exc(); return JSONResponse({"ok": False, "error": str(e)[:500]}, 500)
 
 @app.get("/file/{path:path}")
 def get_file(path):
