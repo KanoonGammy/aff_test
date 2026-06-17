@@ -1,0 +1,13 @@
+# ฐาน (พอให้ /health เขียว + เซิร์ฟเวอร์รัน) — เบา ลงเร็ว
+fastapi
+uvicorn
+pillow
+# torch มากับ template RunPod PyTorch อยู่แล้ว ไม่ต้องลงซ้ำ
+#
+# โมเดลหนักลงตอนใช้จริง (per-node) — ดู README:
+#   พื้นหลัง:  diffusers transformers accelerate
+#   ความคม:   realesrgan
+#   วีดีโอ:    diffusers (Wan2.2) + ffmpeg
+#   เสียง:     f5-tts soundfile
+#   อ่านภาพ:   transformers accelerate qwen-vl-utils
+#   ใส่ชุด:    (clone CatVTON repo + ckpt)
