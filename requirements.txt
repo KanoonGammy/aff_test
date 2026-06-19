@@ -1,16 +1,48 @@
+# ===== ลงครั้งเดียวครบทุกโหนด =====  pip install -r requirements.txt
+# (อัปเดตถึง server v9 · 2026-06-19)
+
+# --- ฐาน เซิร์ฟเวอร์ ---
 fastapi
 uvicorn
 pillow
-numpy
-huggingface_hub
-diffusers
-transformers
+
+# --- diffusers stack (พื้นหลัง Flux Kontext / วีดีโอ Wan2.2 / ฯลฯ) ---
+diffusers==0.38.0          # pin: รองรับ FluxKontext + Wan2.2 + AutoencoderKLWan
+transformers>=4.49.0
 accelerate
+huggingface_hub
 sentencepiece
 protobuf
+
+# --- อ่านภาพ (Qwen2-VL) ---
 qwen-vl-utils
+
+# --- วีดีโอ (Wan2.2-TI2V-5B) ---
+ftfy                       # ★ Wan ใช้ clean ข้อความ — ไม่มี = NameError ตอนเจน
 imageio
 imageio-ffmpeg
-soundfile
+
+# --- ความคม (Real-ESRGAN) ---
 realesrgan
-basicsr
+basicsr                    # ★ ต้อง patch functional_tensor หลังลง (ดู RUNPOD-SNAPSHOT ข้อ 11)
+
+# --- ใส่ชุด (CatVTON) ---
+scipy
+opencv-python
+einops
+av
+
+# --- เสียง (F5-TTS) ---
+soundfile
+
+# =========================================================
+# === ต้องทำมือครั้งเดียว (requirements ไม่ครอบ) ===
+# 1) torch: template มา 2.4.1 ซึ่งชนกับ diffusers (infer_schema error) → อัปเป็น 2.5.1
+#    pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+# 2) detectron2 (DensePose ทำ mask ให้ CatVTON) — คอมไพล์จาก source
+#    pip install 'git+https://github.com/facebookresearch/detectron2.git'
+# 3) basicsr patch (torchvision 0.20 ตัด functional_tensor):
+#    sed -i 's/functional_tensor/functional/' /usr/local/lib/python3.11/dist-packages/basicsr/data/degradations.py
+# 4) Flux Kontext = gated → export HF_TOKEN=...  + กด Agree ที่ huggingface.co/black-forest-labs/FLUX.1-Kontext-dev
+#    (token ต้องติ๊ก "Read access to public gated repos")
+# 5) เสียง F5-TTS: pip install f5-tts  + วางไฟล์เสียงต้นแบบ ./voice/ref.wav
