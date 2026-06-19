@@ -1,6 +1,7 @@
-# server.py - Khanun affiliate inference (RunPod) - v3
-# fixes: persist on /workspace (survives Stop) + /warmup endpoint (preload model inside Pod, avoids 100s proxy 524)
-import base64, io, os, time, uuid, gc
+# server.py - Khanun affiliate inference (RunPod) - v4
+# v4: + CatVTON wrapper (h_vton ใส่ชุดจริง บน RunPod ฟรี) — clone repo + AutoMasker(densepose+schp) + pipeline
+# v3: persist on /workspace (survives Stop) + /warmup endpoint (preload model inside Pod, avoids 100s proxy 524)
+import base64, io, os, sys, time, uuid, gc, subprocess
 import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
@@ -13,13 +14,17 @@ os.makedirs(OUT, exist_ok=True); os.makedirs(MODELS_ROOT, exist_ok=True)
 os.environ.setdefault("HF_HOME", os.path.join(MODELS_ROOT, "_hf"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+CAT_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32   # CatVTON/SD-inpaint ชอบ fp16
 GPU_PROFILE = os.environ.get("GPU_PROFILE", "a100")
+CATVTON_DIR = os.path.join(MODELS_ROOT, "CatVTON_repo")
 
-app = FastAPI(title="Khanun Affiliate Inference v3")
+app = FastAPI(title="Khanun Affiliate Inference v4")
 
 def _safe(name):
     return "".join(c for c in (name or "") if c.isalnum() or c in "-_ ")[:40].strip().replace(" ", "_") or "job"
 def _decode(s):
+    if s is None:
+        raise ValueError("missing image")
     if s.startswith("data:"):
         s = s.split(",", 1)[1]; return Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
     import urllib.request
@@ -70,6 +75,39 @@ def _load_f5():
     from f5_tts.api import F5TTS
     return F5TTS()
 
+def _load_catvton():
+    """โหลด CatVTON: clone repo (โค้ด model/utils) + snapshot น้ำหนัก + สร้าง pipeline + AutoMasker(densepose+schp)"""
+    # 1) โค้ด CatVTON (model/, utils.py, densepose/) — ไม่มีบน pip ต้อง clone
+    if not os.path.isdir(CATVTON_DIR):
+        print("[catvton] clone repo ...", flush=True)
+        subprocess.run(["git", "clone", "--depth", "1",
+                        "https://github.com/Zheng-Chong/CatVTON", CATVTON_DIR], check=True)
+    if CATVTON_DIR not in sys.path:
+        sys.path.insert(0, CATVTON_DIR)
+    # 2) เช็ค detectron2 (จำเป็นสำหรับ DensePose ทำ mask) — ถ้าไม่มีบอกชัด ๆ
+    try:
+        import detectron2  # noqa: F401
+    except Exception:
+        raise RuntimeError("detectron2 ยังไม่ลง — รัน: pip install 'git+https://github.com/facebookresearch/detectron2.git' (ดู CatVTON-SETUP.md)")
+    # 3) น้ำหนัก CatVTON (รวม DensePose + SCHP) จาก HF
+    from huggingface_hub import snapshot_download
+    repo = snapshot_download(repo_id="zhengchong/CatVTON")
+    # 4) สร้าง pipeline + masker
+    from model.pipeline import CatVTONPipeline
+    from model.cloth_masker import AutoMasker
+    pipe = CatVTONPipeline(
+        base_ckpt="booksforcharlie/stable-diffusion-inpainting",   # SD-inpaint ฐาน (mirror ที่ CatVTON ใช้)
+        attn_ckpt=repo, attn_ckpt_version="mix",
+        weight_dtype=CAT_DTYPE, device=DEVICE, skip_safety_check=True)
+    masker = AutoMasker(densepose_ckpt=os.path.join(repo, "DensePose"),
+                        schp_ckpt=os.path.join(repo, "SCHP"), device=DEVICE)
+    return (pipe, masker)
+
+# หมวดเสื้อ -> ชนิด mask ของ CatVTON
+_CAT_MASK = {"tops": "upper", "upper": "upper", "top": "upper", "shirt": "upper",
+             "bottoms": "lower", "lower": "lower", "pants": "lower", "skirt": "lower",
+             "dress": "overall", "dresses": "overall", "auto": "overall", "overall": "overall", "full": "overall"}
+
 def h_kontext(req, ip):
     imgs = ip.get("images") or ([ip["image_url"]] if ip.get("image_url") else [])
     out = _need("kontext", _load_kontext)(image=_decode(imgs[0]), prompt=ip.get("prompt", ""),
@@ -102,21 +140,40 @@ def h_tts(req, ip):
 def h_vision(req, ip):
     img = _decode(ip.get("image_url") or (ip.get("image_urls") or [""])[0])
     m, pr = _need("qwen", _load_qwen)
-    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe the clothing/product briefly in Thai (color, neckline, sleeves, hem, fabric)."}]}]
+    # v4: prompt เจาะจง + ห้ามเดา/ห้ามซ้ำ (กันหลอน "แขนยาว แขนยาว")
+    instr = ("บรรยายชุด/สินค้าในภาพ สั้น กระชับ เป็นภาษาไทย ระบุเฉพาะที่เห็นชัด: "
+             "ประเภท, สี, ทรงคอ, ความยาวแขน, ความยาวชาย, ลักษณะผ้า. "
+             "ถ้าไม่ชัดให้เขียน 'ไม่แน่ใจ'. ห้ามเดา ห้ามพูดซ้ำคำเดิม ตอบ 1-2 ประโยค.")
+    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": instr}]}]
     t = pr.apply_chat_template(msgs, add_generation_prompt=True)
     b = pr(text=[t], images=[img], return_tensors="pt").to(m.device)
-    o = m.generate(**b, max_new_tokens=200)
-    ans = pr.batch_decode(o[:, b.input_ids.shape[1]:], skip_special_tokens=True)[0]
+    o = m.generate(**b, max_new_tokens=120, repetition_penalty=1.3, do_sample=False)
+    ans = pr.batch_decode(o[:, b.input_ids.shape[1]:], skip_special_tokens=True)[0].strip()
     return {"output": ans, "outputs": [ans]}
 def h_vton(req, ip):
-    raise RuntimeError("CatVTON wrapper ยังไม่ติดตั้ง — โหนดใส่ชุดใช้ fal ไปก่อน")
+    """ใส่ชุดบนนางแบบด้วย CatVTON (ฟรี บน RunPod)"""
+    person = _decode(ip.get("person") or ip.get("image_url") or ip.get("model_image"))
+    garment = _decode(ip.get("garment") or ip.get("cloth") or ip.get("product"))
+    cat = _CAT_MASK.get(str(ip.get("category") or "auto").lower(), "overall")
+    pipe, masker = _need("catvton", _load_catvton)
+    from utils import resize_and_crop, resize_and_padding
+    W, H = 768, 1024
+    person_r = resize_and_crop(person, (W, H))
+    garment_r = resize_and_padding(garment, (W, H))
+    mask = masker(person_r, cat)["mask"]
+    gen = torch.Generator(device=DEVICE).manual_seed(int(ip.get("seed", 42)))
+    out = pipe(image=person_r, condition_image=garment_r, mask=mask,
+               num_inference_steps=int(ip.get("steps", 50)),
+               guidance_scale=float(ip.get("guidance", 2.5)),
+               height=H, width=W, generator=gen)[0]
+    return {"images": [{"url": _url(req, _save_img(out, ip, "tryon"))}]}
 
-ROUTER = {"kolors-virtual-try-on": h_vton, "fashn/tryon": h_vton, "idm": h_vton,
+ROUTER = {"kolors-virtual-try-on": h_vton, "fashn/tryon": h_vton, "tryon": h_vton, "idm": h_vton, "catvton": h_vton,
     "flux-pro/kontext": h_kontext, "kontext": h_kontext, "clarity-upscaler": h_upscale, "upscaler": h_upscale,
     "image-to-video": h_video, "wan": h_video, "kling-video": h_video, "hailuo": h_video,
     "tts": h_tts, "elevenlabs": h_tts, "vision": h_vision, "any-llm": h_vision}
 WARM = {"bg": ("kontext", _load_kontext), "video": ("wan", _load_wan), "upscale": ("upscale", _load_upscaler),
-    "vision": ("qwen", _load_qwen), "voice": ("f5", _load_f5)}
+    "vision": ("qwen", _load_qwen), "voice": ("f5", _load_f5), "vton": ("catvton", _load_catvton)}
 
 @app.get("/health")
 def health():
@@ -125,12 +182,12 @@ def health():
         free, total = torch.cuda.mem_get_info(); used = round((total - free) / 1e9, 1)
     return {"ok": True, "device": DEVICE, "loaded": _L["name"], "profile": GPU_PROFILE,
         "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used,
-        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT}
+        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v4"}
 
 @app.post("/warmup")
 async def warmup(req: Request):
     body = await req.json(); node = body.get("node", "")
-    if node not in WARM: return JSONResponse({"ok": False, "error": "warmup node: bg|video|upscale|vision|voice"}, 400)
+    if node not in WARM: return JSONResponse({"ok": False, "error": "warmup node: bg|video|upscale|vision|voice|vton"}, 400)
     name, loader = WARM[node]
     try:
         _need(name, loader); return {"ok": True, "loaded": name, "msg": "model in VRAM — app /infer will be fast now"}
