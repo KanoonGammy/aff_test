@@ -1,4 +1,6 @@
-# server.py - Khanun affiliate inference (RunPod) - v9
+# server.py - Khanun affiliate inference (RunPod) - v11
+# v11: (1) h_kontext รับ image_urls (เดิม IndexError → ฉาก/ท่าไม่เปลี่ยน) (2) kontext/wan ใช้ cpu_offload + wan vae tiling กัน OOM (3) cache เก็บแค่ pinned(qwen,upscale)+1 ตัว กัน VRAM เต็ม
+# v10: ปิด HF xet (HF_HUB_DISABLE_XET) → ดาวน์โหลดแบบคลาสสิก กัน "Background writer channel closed" ตอนโหลดโมเดล
 # v9: PIN โมเดลอ่านชุด (qwen/vision) ไว้ใน VRAM ไม่ให้เขี่ยออก (ใช้ทุกงาน) — เขี่ยตัวอื่นก่อนเสมอ
 # v8: cache หลายโมเดลใน VRAM พร้อมกัน (LRU · การ์ด 48GB) — ไม่ต้องโหลดซ้ำตอนสลับโหนด · VRAM ไม่พอ = เขี่ย LRU ออกเอง
 # v7: คืนผลเป็น base64 inline (รูป/วิดีโอ) → backend ไม่ต้องดึง /file ซ้ำ (แก้ download_failed/WinError 10060 ตอน Pod คืน URL ภายใน)
@@ -17,13 +19,14 @@ OUT = os.environ.get("OUT_DIR", os.path.join(PERSIST, "aff_outputs"))
 MODELS_ROOT = os.environ.get("MODELS_ROOT", os.path.join(PERSIST, "aff_models"))
 os.makedirs(OUT, exist_ok=True); os.makedirs(MODELS_ROOT, exist_ok=True)
 os.environ.setdefault("HF_HOME", os.path.join(MODELS_ROOT, "_hf"))
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # v10: ปิด xet → ดาวน์โหลดแบบคลาสสิก กัน "Background writer channel closed" ตอนดิสก์ตึง
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 CAT_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32   # CatVTON/SD-inpaint ชอบ fp16
 GPU_PROFILE = os.environ.get("GPU_PROFILE", "a100")
 CATVTON_DIR = os.path.join(MODELS_ROOT, "CatVTON_repo")
 
-app = FastAPI(title="Khanun Affiliate Inference v9")
+app = FastAPI(title="Khanun Affiliate Inference v11")
 
 def _safe(name):
     return "".join(c for c in (name or "") if c.isalnum() or c in "-_ ")[:40].strip().replace(" ", "_") or "job"
@@ -58,20 +61,25 @@ def _file_uri(path, mime):
 # v9: PIN โมเดลอ่านชุด (qwen) ไว้ไม่ให้เขี่ยออก เพราะใช้ทุกงาน (เขี่ยตัวอื่นก่อนเสมอ)
 from collections import OrderedDict
 _CACHE = OrderedDict()   # name -> obj
-_PIN = {"qwen"}          # โมเดลที่ pin ไว้ (vision อ่านชุด) — เขี่ยเป็นตัวสุดท้ายเมื่อจำเป็นจริง ๆ
+_PIN = {"qwen", "upscale"}   # v11: pin ตัวเล็กที่ใช้บ่อย (vision อ่านชุด + upscale) — โมเดลใหญ่ห้ามอยู่ร่วมกันบน 48GB
 def _free():
     _CACHE.clear(); gc.collect()
     if DEVICE == "cuda": torch.cuda.empty_cache()
 def _evict_lru():
-    # หาตัวที่ "ไม่ pin" เก่าสุดเขี่ยก่อน · ถ้าเหลือแต่ pinned ค่อยเขี่ย pinned
     target = next((n for n in _CACHE if n not in _PIN), None) or next(iter(_CACHE), None)
     if target is not None:
-        _CACHE.pop(target); print("[evict]", target, "(เปิดที่ให้โมเดลใหม่)", flush=True)
+        _CACHE.pop(target); print("[evict]", target, flush=True)
         gc.collect()
         if DEVICE == "cuda": torch.cuda.empty_cache()
 def _need(name, loader):
     if name in _CACHE:
         _CACHE.move_to_end(name); return _CACHE[name]     # มีใน VRAM แล้ว → ใช้เลย ไม่โหลดซ้ำ
+    # v11: ก่อนโหลดตัวใหม่ → เขี่ย non-pinned ออกหมด (เก็บแค่ pinned + ตัวนี้) กัน VRAM เต็มบน 48GB
+    if name not in _PIN:
+        for n in [k for k in list(_CACHE) if k not in _PIN]:
+            _CACHE.pop(n); print("[evict]", n, "(เปิดที่ให้", name, ")", flush=True)
+        gc.collect()
+        if DEVICE == "cuda": torch.cuda.empty_cache()
     while True:
         try:
             print("[load]", name, flush=True); t0 = time.time()
@@ -93,14 +101,18 @@ def _place(p):
 def _load_kontext():
     from diffusers import FluxKontextPipeline
     p = FluxKontextPipeline.from_pretrained("black-forest-labs/FLUX.1-Kontext-dev", torch_dtype=DTYPE)
-    return _place(p)
+    p.enable_model_cpu_offload()   # v11: offload (โมเดลใหญ่) กัน OOM ตอนอยู่ร่วมกับ qwen ที่ pin
+    return p
 def _load_wan():
     # v5: ใช้ TI2V-5B (เบา RAM ~16GB / VRAM ~24GB) แทน A14B (~50GB RAM = OOM บน Pod 46GB)
     from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
     mid = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
     vae = AutoencoderKLWan.from_pretrained(mid, subfolder="vae", torch_dtype=torch.float32)   # VAE ต้อง fp32
     p = WanImageToVideoPipeline.from_pretrained(mid, vae=vae, torch_dtype=DTYPE)
-    return _place(p)
+    try: p.vae.enable_tiling()     # v11: ลด VRAM ตอน VAE decode (กัน OOM ที่ขั้น decode)
+    except Exception: pass
+    p.enable_model_cpu_offload()   # v11: offload กัน OOM
+    return p
 def _load_upscaler():
     from realesrgan import RealESRGANer
     from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -152,7 +164,8 @@ _CAT_MASK = {"tops": "upper", "upper": "upper", "top": "upper", "shirt": "upper"
              "dress": "overall", "dresses": "overall", "auto": "overall", "overall": "overall", "full": "overall"}
 
 def h_kontext(req, ip):
-    imgs = ip.get("images") or ([ip["image_url"]] if ip.get("image_url") else [])
+    # v11: รับ image_urls (backend /affiliate/fal-image ส่ง key นี้) — เดิมอ่านแค่ images = IndexError → ฉาก/ท่าไม่เปลี่ยน
+    imgs = ip.get("images") or ip.get("image_urls") or ([ip["image_url"]] if ip.get("image_url") else [])
     out = _need("kontext", _load_kontext)(image=_decode(imgs[0]), prompt=ip.get("prompt", ""),
         guidance_scale=3.5, num_inference_steps=int(ip.get("steps", 28))).images[0]
     _save_img(out, ip, "kontext"); return {"images": [{"url": _img_uri(out)}]}
@@ -228,7 +241,7 @@ def health():
         free, total = torch.cuda.mem_get_info(); used = round((total - free) / 1e9, 1)
     return {"ok": True, "device": DEVICE, "loaded": list(_CACHE.keys()), "profile": GPU_PROFILE,
         "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used,
-        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v9", "pinned": list(_PIN)}
+        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v11", "pinned": list(_PIN)}
 
 @app.post("/warmup")
 async def warmup(req: Request):
