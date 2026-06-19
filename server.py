@@ -1,4 +1,6 @@
-# server.py - Khanun affiliate inference (RunPod) - v4
+# server.py - Khanun affiliate inference (RunPod) - v6
+# v6: (1) h_vton รับ key ของแอปจริง human_image_url/garment_image_url/model_image  (2) ใส่ทั้งโมเดลลง GPU (48GB การ์ด) เลิก cpu_offload = เร็ว+ใช้ GPU เต็ม  (3) warmup/infer บอกเวลา (วิ)
+# v5: video เปลี่ยนเป็น Wan2.2-TI2V-5B (เบา RAM ~16GB) แทน A14B ที่ OOM บน Pod 46GB RAM
 # v4: + CatVTON wrapper (h_vton ใส่ชุดจริง บน RunPod ฟรี) — clone repo + AutoMasker(densepose+schp) + pipeline
 # v3: persist on /workspace (survives Stop) + /warmup endpoint (preload model inside Pod, avoids 100s proxy 524)
 import base64, io, os, sys, time, uuid, gc, subprocess
@@ -18,7 +20,7 @@ CAT_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32   # CatVTON/SD-
 GPU_PROFILE = os.environ.get("GPU_PROFILE", "a100")
 CATVTON_DIR = os.path.join(MODELS_ROOT, "CatVTON_repo")
 
-app = FastAPI(title="Khanun Affiliate Inference v4")
+app = FastAPI(title="Khanun Affiliate Inference v6")
 
 def _safe(name):
     return "".join(c for c in (name or "") if c.isalnum() or c in "-_ ")[:40].strip().replace(" ", "_") or "job"
@@ -47,17 +49,30 @@ def _free():
     if DEVICE == "cuda": torch.cuda.empty_cache()
 def _need(name, loader):
     if _L["name"] != name:
-        _free(); print("[load]", name, flush=True); _L["obj"] = loader(); _L["name"] = name
+        _free(); print("[load]", name, flush=True); t0 = time.time()
+        _L["obj"] = loader(); _L["name"] = name
+        print("[load]", name, "done", round(time.time() - t0, 1), "s", flush=True)
     return _L["obj"]
+
+def _place(p):
+    """การ์ด 48GB (RTX 6000 Ada/A40): ใส่ทั้งโมเดลลง GPU = เร็ว + ใช้ GPU เต็ม · VRAM ไม่พอ → fallback cpu_offload"""
+    try:
+        return p.to(DEVICE)
+    except Exception as e:
+        print("[place->cpu_offload]", str(e)[:120], flush=True)
+        p.enable_model_cpu_offload(); return p
 
 def _load_kontext():
     from diffusers import FluxKontextPipeline
     p = FluxKontextPipeline.from_pretrained("black-forest-labs/FLUX.1-Kontext-dev", torch_dtype=DTYPE)
-    p.enable_model_cpu_offload(); return p
+    return _place(p)
 def _load_wan():
-    from diffusers import WanImageToVideoPipeline
-    p = WanImageToVideoPipeline.from_pretrained("Wan-AI/Wan2.2-I2V-A14B-Diffusers", torch_dtype=DTYPE)
-    p.enable_model_cpu_offload(); return p
+    # v5: ใช้ TI2V-5B (เบา RAM ~16GB / VRAM ~24GB) แทน A14B (~50GB RAM = OOM บน Pod 46GB)
+    from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
+    mid = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    vae = AutoencoderKLWan.from_pretrained(mid, subfolder="vae", torch_dtype=torch.float32)   # VAE ต้อง fp32
+    p = WanImageToVideoPipeline.from_pretrained(mid, vae=vae, torch_dtype=DTYPE)
+    return _place(p)
 def _load_upscaler():
     from realesrgan import RealESRGANer
     from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -88,7 +103,7 @@ def _load_catvton():
     try:
         import detectron2  # noqa: F401
     except Exception:
-        raise RuntimeError("detectron2 ยังไม่ลง — รัน: pip install 'git+https://github.com/facebookresearch/detectron2.git' (ดู CatVTON-SETUP.md)")
+        raise RuntimeError("detectron2 ยังไม่ลง — รัน: pip install 'git+https://github.com/facebookresearch/detectron2.git' (ดู RUNPOD-SNAPSHOT.md ขั้น D)")
     # 3) น้ำหนัก CatVTON (รวม DensePose + SCHP) จาก HF
     from huggingface_hub import snapshot_download
     repo = snapshot_download(repo_id="zhengchong/CatVTON")
@@ -125,8 +140,9 @@ def h_upscale(req, ip):
     return {"images": [{"url": _url(req, _save_img(out, ip, "hq"))}]}
 def h_video(req, ip):
     src = _decode(ip.get("image") or ip.get("image_url")); secs = int(float(ip.get("duration", 10)))
+    nframes = min(secs, 5) * 16 + 1   # Wan ต้องการ 4n+1 เฟรม (16*วิ หาร 4 ลงตัว → +1)
     fr = _need("wan", _load_wan)(image=src, prompt=ip.get("prompt", ""),
-        num_frames=min(secs, 5) * 16, num_inference_steps=int(ip.get("steps", 30))).frames[0]
+        num_frames=nframes, num_inference_steps=int(ip.get("steps", 30))).frames[0]
     from diffusers.utils import export_to_video
     d = _job_dir(ip); fn = "clip_%s.mp4" % uuid.uuid4().hex[:8]; export_to_video(fr, os.path.join(d, fn), fps=16)
     return {"video": {"url": _url(req, os.path.relpath(os.path.join(d, fn), OUT))}}
@@ -152,8 +168,9 @@ def h_vision(req, ip):
     return {"output": ans, "outputs": [ans]}
 def h_vton(req, ip):
     """ใส่ชุดบนนางแบบด้วย CatVTON (ฟรี บน RunPod)"""
-    person = _decode(ip.get("person") or ip.get("image_url") or ip.get("model_image"))
-    garment = _decode(ip.get("garment") or ip.get("cloth") or ip.get("product"))
+    # v6: รับ key ของแอปจริง (Kolors=human_image_url/garment_image_url · fashn=model_image/garment_image)
+    person = _decode(ip.get("person") or ip.get("human_image_url") or ip.get("model_image") or ip.get("image_url"))
+    garment = _decode(ip.get("garment") or ip.get("garment_image_url") or ip.get("garment_image") or ip.get("cloth") or ip.get("product"))
     cat = _CAT_MASK.get(str(ip.get("category") or "auto").lower(), "overall")
     pipe, masker = _need("catvton", _load_catvton)
     from utils import resize_and_crop, resize_and_padding
@@ -182,7 +199,7 @@ def health():
         free, total = torch.cuda.mem_get_info(); used = round((total - free) / 1e9, 1)
     return {"ok": True, "device": DEVICE, "loaded": _L["name"], "profile": GPU_PROFILE,
         "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used,
-        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v4"}
+        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v6"}
 
 @app.post("/warmup")
 async def warmup(req: Request):
@@ -190,7 +207,8 @@ async def warmup(req: Request):
     if node not in WARM: return JSONResponse({"ok": False, "error": "warmup node: bg|video|upscale|vision|voice|vton"}, 400)
     name, loader = WARM[node]
     try:
-        _need(name, loader); return {"ok": True, "loaded": name, "msg": "model in VRAM — app /infer will be fast now"}
+        t0 = time.time(); _need(name, loader); el = round(time.time() - t0, 1)
+        return {"ok": True, "loaded": name, "seconds": el, "msg": f"model in VRAM ({el}s) — app /infer will be fast now"}
     except Exception as e:
         import traceback; traceback.print_exc(); return JSONResponse({"ok": False, "error": str(e)[:500]}, 500)
 
