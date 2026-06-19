@@ -1,10 +1,10 @@
 # server.py - Khanun affiliate inference (RunPod) - v13
-# v13 (2026-06-19): โมเดล "ประจำโหนด" ครบทุกโหนด + ระบบลบโมเดลที่ไม่ใช้บน disk
+# v13 (2026-06-19): โมเดล "ประจำโหนด" ครบทุกโหนด + ลบโมเดลไม่ใช้บน disk + เลือกรุ่นวิดีโอ/edit ได้
 #   vision  : Qwen2.5-VL-7B-Instruct  (แก้หลอน · repetition_penalty 1.1)
 #   vton    : CatVTON (ตั้งต้น ใช้ได้จริง) | VTON_MODEL=idm (ยังเป็นโครง → fallback CatVTON อัตโนมัติ)
-#   bg      : FLUX.1-Kontext-dev      (ลง GPU เต็ม เร็ว)
-#   video   : Wan2.1-I2V-14B-720P (ตั้งต้น · ลง GPU เต็ม 48GB ไม่ offload) | WAN_MODEL=5B | A14B
-#             v13.2 เลือกวินาที+แพลตฟอร์ม · v13.3 video registry (คุม fps/flow_shift ตามรุ่น)
+#   edit/bg : EDIT_MODEL=kontext (FLUX.1-Kontext-dev · ตั้งต้น ลงเต็ม 48GB) | qwen (Qwen-Image-Edit-2511 8bit · ทำตามคำสั่งดีกว่า)
+#             บังคับสัดส่วน 9:16 (TikTok) · guidance 4.0
+#   video   : WAN_MODEL=WAN21 (Wan2.1-I2V-14B-720P ตั้งต้น ลงเต็ม 48GB) | 5B | A14B  · เลือกวินาที+แพลตฟอร์ม 720p
 #   upscale : Real-ESRGAN x4plus + GFPGAN face enhance
 #   voice   : F5-TTS-THAI
 #   DISK: GET /disk · POST /disk/prune {"confirm":true}
@@ -14,7 +14,7 @@ import base64, io, os, sys, time, uuid, gc, shutil, subprocess
 import torch
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, FileResponse
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
 PERSIST = "/workspace" if os.path.isdir("/workspace") else os.getcwd()
 OUT = os.environ.get("OUT_DIR", os.path.join(PERSIST, "aff_outputs"))
@@ -33,26 +33,30 @@ FORCE_OFFLOAD = os.environ.get("FORCE_CPU_OFFLOAD", "0") == "1"
 
 # ===== โมเดลประจำโหนด (เปลี่ยนผ่าน env ได้) =====
 VISION_MODEL = os.environ.get("VISION_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
-KONTEXT_MODEL = os.environ.get("KONTEXT_MODEL", "black-forest-labs/FLUX.1-Kontext-dev")
-VTON_MODEL = os.environ.get("VTON_MODEL", "catvton").lower()   # default catvton (ใช้ได้จริง) · idm ยังเป็นโครง=fallback
+VTON_MODEL = os.environ.get("VTON_MODEL", "catvton").lower()   # catvton (ใช้ได้จริง) | idm (โครง → fallback)
 FACE_ENHANCE = os.environ.get("FACE_ENHANCE", "1") == "1"
 
-# ===== วิดีโอ: registry เลือกรุ่นได้ (คุม repo/fps/offload/flow_shift ให้ถูกตามรุ่น) =====
-#   key -> (repo, fps_native, ต้อง_offload?, flow_shift)
+# ----- โหนดแต่งภาพ/ฉาก (edit) เลือกได้ -----
+EDIT_MODEL = os.environ.get("EDIT_MODEL", "kontext").lower()   # kontext (FLUX.1-Kontext-dev · ลงเต็ม 48GB) | qwen
+KONTEXT_MODEL = os.environ.get("KONTEXT_MODEL", "black-forest-labs/FLUX.1-Kontext-dev")
+QWEN_EDIT_MODEL = os.environ.get("QWEN_EDIT_MODEL", "Qwen/Qwen-Image-Edit-2511")
+QWEN_EDIT_QUANT = os.environ.get("QWEN_EDIT_QUANT", "8bit").lower()   # 8bit (~38GB ลง 48GB) | 4bit | none(offload)
+EDIT_NEG = os.environ.get("EDIT_NEG", "blurry, low quality, distorted, deformed, extra limbs, extra fingers, watermark, text")
+
+# ----- โหนดวิดีโอ: registry (คุม repo/fps/offload/flow_shift ตามรุ่น) -----
 WAN_CFG = {
-    "WAN21": ("Wan-AI/Wan2.1-I2V-14B-720P-Diffusers", 16, False, 5.0),   # ★ default: 14B เดี่ยว ~38-40GB ลงเต็ม 48GB · 16fps · flow_shift 5.0(720p)
+    "WAN21": ("Wan-AI/Wan2.1-I2V-14B-720P-Diffusers", 16, False, 5.0),   # ★ default: 14B เดี่ยว ~38-40GB ลงเต็ม · 16fps · flow_shift 5.0
     "5B":    ("Wan-AI/Wan2.2-TI2V-5B-Diffusers",      24, False, None),  # เบา/เร็ว · 24fps
-    "A14B":  ("Wan-AI/Wan2.2-I2V-A14B-Diffusers",     24, True,  None),  # ดีสุดแต่ ~56GB → offload (RAM หนัก เสี่ยง OOM)
+    "A14B":  ("Wan-AI/Wan2.2-I2V-A14B-Diffusers",     24, True,  None),  # ดีสุดแต่ ~56GB → offload (RAM หนัก)
 }
 WAN_MODEL_KEY = os.environ.get("WAN_MODEL", "WAN21").upper()
 if WAN_MODEL_KEY not in WAN_CFG: WAN_MODEL_KEY = "WAN21"
 WAN_MODEL, WAN_FPS, WAN_OFFLOAD, WAN_FLOWSHIFT = WAN_CFG[WAN_MODEL_KEY]
 
-# ===== วิดีโอ: เลือกวินาที + แพลตฟอร์ม (สัดส่วน) =====
-MAX_SECONDS = float(os.environ.get("MAX_SECONDS", "10"))         # เพดานความยาว
+# ----- วิดีโอ: วินาที + แพลตฟอร์ม -----
+MAX_SECONDS = float(os.environ.get("MAX_SECONDS", "10"))
 DEFAULT_PLATFORM = os.environ.get("DEFAULT_PLATFORM", "tiktok").lower()
-# ขนาด gen ~720p (หาร 16 ลงตัว) · อิงตาราง docs/hyperframes-reference.md (TikTok/Reels/Shorts=9:16, YouTube=16:9, Feed=1:1)
-PLATFORM = {
+PLATFORM = {   # gen ~720p (หาร 16 ลงตัว) · อิง docs/hyperframes-reference.md
     "tiktok": (720, 1280), "shopee": (720, 1280), "reels": (720, 1280), "shorts": (720, 1280),
     "9:16": (720, 1280), "vertical": (720, 1280), "portrait": (720, 1280),
     "youtube": (1280, 720), "16:9": (1280, 720), "landscape": (1280, 720),
@@ -62,7 +66,12 @@ VIDEO_NEG = os.environ.get("VIDEO_NEG",
     "blurry, low quality, low resolution, jpeg artifacts, flickering, jitter, ghosting, "
     "warping, deformed, distorted, extra fingers, extra limbs, watermark, text, "
     "oversaturated, cartoon, 3d, cgi, slow motion, shaky cam")
-# โมเดลฐานของ CatVTON / IDM
+# ขนาดเอาต์พุต edit/ฉาก ตามแพลตฟอร์ม (FLUX/Qwen ชอบหาร 16 · ~1MP) — ดีฟอลต์ 9:16 แนวตั้ง
+EDIT_AR = {"tiktok": (768, 1344), "reels": (768, 1344), "shorts": (768, 1344), "shopee": (768, 1344),
+           "9:16": (768, 1344), "vertical": (768, 1344), "portrait": (768, 1344),
+           "youtube": (1344, 768), "16:9": (1344, 768), "landscape": (1344, 768),
+           "feed": (1024, 1024), "1:1": (1024, 1024), "square": (1024, 1024)}
+
 SD_INPAINT_BASE = "booksforcharlie/stable-diffusion-inpainting"
 IDM_REPO = "yisol/IDM-VTON"
 
@@ -72,14 +81,26 @@ app = FastAPI(title="Khanun Affiliate Inference v13")
 def _safe(name):
     return "".join(c for c in (name or "") if c.isalnum() or c in "-_ ")[:40].strip().replace(" ", "_") or "job"
 def _decode(s):
-    if s is None: raise ValueError("missing image")
+    if s is None or s == "": raise ValueError("ไม่มีภาพ (image ว่าง)")
     if s.startswith("data:"):
         s = s.split(",", 1)[1]; return Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
     import urllib.request
     with urllib.request.urlopen(s, timeout=60) as r:
         return Image.open(io.BytesIO(r.read())).convert("RGB")
+def _first_img(ip):
+    imgs = ip.get("images") or ip.get("image_urls") or ([ip["image_url"]] if ip.get("image_url") else [])
+    if not imgs: raise ValueError("ไม่มีภาพ (images/image_url ว่าง)")
+    return _decode(imgs[0])
 def _clean_prompt(p):
     return " ".join((p or "").split()).strip(" .")
+def _ar_size(ip, table, default):
+    """หาขนาด W,H จาก width/height ที่ส่งมา หรือจาก platform/aspect (ดีฟอลต์ตาม table)"""
+    if ip.get("width") and ip.get("height"):
+        return int(ip["width"]), int(ip["height"])
+    plat = str(ip.get("platform") or ip.get("aspect") or DEFAULT_PLATFORM).lower()
+    return table.get(plat, default)
+def _fit_cover(img, W, H):
+    return ImageOps.fit(img, (W, H), method=Image.LANCZOS)
 def _job_dir(ip):
     d = os.path.join(OUT, _safe(ip.get("job") or ip.get("product"))); os.makedirs(d, exist_ok=True); return d
 def _save_img(img, ip, p="img"):
@@ -154,13 +175,38 @@ def _place(p):
 def _load_kontext():
     from diffusers import FluxKontextPipeline
     p = FluxKontextPipeline.from_pretrained(KONTEXT_MODEL, torch_dtype=DTYPE)
-    return _place(p)
+    return ("kontext", _place(p))
+
+def _load_qwen_edit():
+    # Qwen-Image-Edit-2511 (~20B): bf16 ~55GB ไม่พอ 48GB → 8bit/4bit quant ให้ลงได้ (ต้อง diffusers ล่าสุด + bitsandbytes)
+    from diffusers import QwenImageEditPlusPipeline
+    repo = QWEN_EDIT_MODEL
+    if QWEN_EDIT_QUANT in ("8bit", "4bit"):
+        from diffusers import QwenImageTransformer2DModel, BitsAndBytesConfig
+        qc = (BitsAndBytesConfig(load_in_8bit=True) if QWEN_EDIT_QUANT == "8bit"
+              else BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=DTYPE, bnb_4bit_quant_type="nf4"))
+        tr = QwenImageTransformer2DModel.from_pretrained(repo, subfolder="transformer", quantization_config=qc, torch_dtype=DTYPE)
+        p = QwenImageEditPlusPipeline.from_pretrained(repo, transformer=tr, torch_dtype=DTYPE)
+        p.enable_model_cpu_offload()   # transformer quant อยู่ GPU · text encoder/vae offload = ลง 48GB ปลอดภัย
+    else:
+        p = QwenImageEditPlusPipeline.from_pretrained(repo, torch_dtype=DTYPE)
+        p.enable_model_cpu_offload()
+    return ("qwen", p)
+
+def _load_edit():
+    """โหนดแต่งภาพ: kontext (ตั้งต้น) | qwen (Qwen-Image-Edit) — qwen โหลดพลาด = fallback kontext (ไม่ crash)"""
+    if EDIT_MODEL == "qwen":
+        try:
+            return _load_qwen_edit()
+        except Exception as e:
+            print("[edit] Qwen-Image-Edit โหลดไม่ได้ → FLUX Kontext:", str(e)[:160], flush=True)
+    return _load_kontext()
 
 def _load_wan():
     from diffusers import WanImageToVideoPipeline, AutoencoderKLWan
     vae = AutoencoderKLWan.from_pretrained(WAN_MODEL, subfolder="vae", torch_dtype=torch.float32)
     p = WanImageToVideoPipeline.from_pretrained(WAN_MODEL, vae=vae, torch_dtype=DTYPE)
-    if WAN_FLOWSHIFT:   # Wan2.1 720p ต้องตั้ง flow_shift=5.0 ให้มอชชั่นถูกต้อง (ไม่งั้นภาพไหล/ช้า)
+    if WAN_FLOWSHIFT:   # Wan2.1 720p ต้องตั้ง flow_shift=5.0 ให้มอชชั่นถูกต้อง
         try:
             from diffusers import UniPCMultistepScheduler
             p.scheduler = UniPCMultistepScheduler.from_config(p.scheduler.config, flow_shift=WAN_FLOWSHIFT)
@@ -171,7 +217,7 @@ def _load_wan():
     if WAN_OFFLOAD:
         print("[wan]", WAN_MODEL_KEY, "→ enable_model_cpu_offload (ใหญ่เกิน 48GB · RAM หนัก)", flush=True)
         p.enable_model_cpu_offload(); return p
-    return _place(p)   # WAN21 / 5B ลง GPU เต็มได้
+    return _place(p)
 
 def _load_upscaler():
     # v12 FIX: basicsr import torchvision.transforms.functional_tensor (ถูกลบใน torchvision>=0.17) → shim
@@ -245,7 +291,6 @@ def _load_idm():
     return ("idm", repo, None)
 
 def _load_vton():
-    """เลือก VTON ตาม env: catvton (ตั้งต้น) | idm (ยังเป็นโครง → h_vton fallback CatVTON)"""
     if VTON_MODEL == "idm":
         try:
             return _load_idm()
@@ -259,13 +304,26 @@ _CAT_MASK = {"tops": "upper", "upper": "upper", "top": "upper", "shirt": "upper"
 
 # ---------- handlers ----------
 def h_kontext(req, ip):
-    imgs = ip.get("images") or ip.get("image_urls") or ([ip["image_url"]] if ip.get("image_url") else [])
-    out = _need("kontext", _load_kontext)(image=_decode(imgs[0]), prompt=_clean_prompt(ip.get("prompt", "")),
-        guidance_scale=float(ip.get("guidance", 3.5)), num_inference_steps=int(ip.get("steps", 30))).images[0]
-    _save_img(out, ip, "kontext"); return {"images": [{"url": _img_uri(out)}]}
+    # โหนดแต่งภาพ/ฉาก — รองรับทั้ง FLUX Kontext และ Qwen-Image-Edit · บังคับสัดส่วน 9:16 (default)
+    src = _first_img(ip)
+    prompt = _clean_prompt(ip.get("prompt", ""))
+    W, H = _ar_size(ip, EDIT_AR, (768, 1344))
+    steps = int(ip.get("steps", 30))
+    eng, pipe = _need("edit", _load_edit)
+    if eng == "qwen":
+        src9 = _fit_cover(src, W, H)   # Qwen edit ตามขนาด input → fit เป็น 9:16 ก่อน
+        out = pipe(image=[src9], prompt=prompt, negative_prompt=ip.get("negative_prompt", EDIT_NEG),
+                   true_cfg_scale=float(ip.get("guidance", 4.0)), guidance_scale=1.0,
+                   num_inference_steps=steps, num_images_per_prompt=1).images[0]
+    else:
+        out = pipe(image=src, prompt=prompt, height=H, width=W,
+                   guidance_scale=float(ip.get("guidance", 4.0)), num_inference_steps=steps).images[0]
+    _save_img(out, ip, "edit")
+    print("[edit]", eng, "%dx%d" % (W, H), "steps", steps, flush=True)
+    return {"images": [{"url": _img_uri(out)}]}
 
 def h_upscale(req, ip):
-    img = _decode(ip["image_url"]); f = int(ip.get("upscale_factor", 4))
+    img = _decode(ip.get("image_url") or ip.get("image")); f = int(ip.get("upscale_factor", 4))
     try:
         import numpy as np
         up, face = _need("upscale", _load_upscaler)
@@ -282,24 +340,13 @@ def h_upscale(req, ip):
     _save_img(out, ip, "hq"); return {"images": [{"url": _img_uri(out)}]}
 
 def h_video(req, ip):
-    # v13.2/3: เลือกวินาที + แพลตฟอร์ม · คุณภาพ 720p + fps/flow_shift ตามรุ่น (registry) + negative prompt
     src = _decode(ip.get("image") or ip.get("image_url"))
     secs = float(ip.get("seconds", ip.get("duration", 5)))
     secs = max(2.0, min(secs, MAX_SECONDS))
-    fps = int(ip.get("fps", WAN_FPS))                        # fps ตามรุ่น (Wan2.1=16, Wan2.2-5B=24)
-    want = int(round(secs * fps))
-    nframes = max(17, (want // 4) * 4 + 1)                   # Wan ต้องการ 4n+1
+    fps = int(ip.get("fps", WAN_FPS))                       # fps ตามรุ่น (Wan2.1=16, Wan2.2-5B=24)
+    want = int(round(secs * fps)); nframes = max(17, (want // 4) * 4 + 1)   # Wan ต้องการ 4n+1
     if secs > 5 and WAN_MODEL_KEY != "WAN21": print("[video] เตือน: >5 วิ บนรุ่นเล็กอาจหลุดโฟกัส", flush=True)
-    plat = str(ip.get("platform") or ip.get("aspect") or DEFAULT_PLATFORM).lower()
-    if ip.get("width") and ip.get("height"):
-        W, H = int(ip["width"]), int(ip["height"])
-    elif plat in PLATFORM:
-        W, H = PLATFORM[plat]
-    else:
-        iw, ih = src.size; t = 1280
-        if ih >= iw: H, W = t, int(round(iw / ih * t))
-        else:        W, H = t, int(round(ih / iw * t))
-        W = max(256, (W // 16) * 16); H = max(256, (H // 16) * 16)
+    W, H = _ar_size(ip, PLATFORM, (720, 1280))
     fr = _need("wan", _load_wan)(image=src, prompt=_clean_prompt(ip.get("prompt", "")),
         negative_prompt=ip.get("negative_prompt", VIDEO_NEG),
         height=H, width=W, num_frames=nframes,
@@ -307,8 +354,9 @@ def h_video(req, ip):
         num_inference_steps=int(ip.get("steps", 40))).frames[0]
     from diffusers.utils import export_to_video
     d = _job_dir(ip); fp = os.path.join(d, "clip_%s.mp4" % uuid.uuid4().hex[:8]); export_to_video(fr, fp, fps=fps)
+    plat = str(ip.get("platform") or ip.get("aspect") or DEFAULT_PLATFORM).lower()
     print("[video]", WAN_MODEL_KEY, plat, "%dx%d" % (W, H), nframes, "frames", fps, "fps", round(secs, 1), "s", flush=True)
-    return {"video": {"url": _file_uri(fp, "video/mp4"), "model": WAN_MODEL_KEY, "platform": plat, "w": W, "h": H, "seconds": round(secs, 1)}}
+    return {"video": {"url": _file_uri(fp, "video/mp4"), "model": WAN_MODEL_KEY, "w": W, "h": H, "seconds": round(secs, 1)}}
 
 def h_tts(req, ip):
     dd = ip.get("inputs", ip)
@@ -320,7 +368,7 @@ def h_tts(req, ip):
     return {"audio_url": "data:audio/wav;base64," + base64.b64encode(b.getvalue()).decode("ascii")}
 
 def h_vision(req, ip):
-    img = _decode(ip.get("image_url") or (ip.get("image_urls") or [""])[0])
+    img = _first_img(ip) if (ip.get("images") or ip.get("image_urls")) else _decode(ip.get("image_url"))
     m, pr = _need("qwen", _load_qwen)
     instr = ("Describe ONLY what is clearly visible in this clothing/product photo. "
              "Report: type, color, neckline, sleeve length, hem length, fabric look. "
@@ -355,7 +403,6 @@ def h_vton(req, ip):
     cat = _CAT_MASK.get(str(ip.get("category") or "auto").lower(), "overall")
     engine_t = _need("vton", _load_vton)
     if engine_t[0] != "catvton":
-        # IDM ยังไม่รองรับ inference → fallback CatVTON อัตโนมัติ (เลิก 500 NotImplementedError)
         print("[vton] IDM inference ยังไม่พร้อม → ใช้ CatVTON แทน", flush=True)
         engine_t = _force_catvton()
     out = _run_catvton(engine_t[1], engine_t[2], person, garment, cat, ip)
@@ -363,7 +410,8 @@ def h_vton(req, ip):
 
 # ---------- disk management ----------
 def _keep_repos():
-    keep = {KONTEXT_MODEL, VISION_MODEL, WAN_MODEL, "zhengchong/CatVTON", SD_INPAINT_BASE}
+    keep = {VISION_MODEL, WAN_MODEL, "zhengchong/CatVTON", SD_INPAINT_BASE}
+    keep.add(KONTEXT_MODEL if EDIT_MODEL != "qwen" else QWEN_EDIT_MODEL)
     if VTON_MODEL == "idm": keep.add(IDM_REPO)
     return keep
 def _hub_dir():
@@ -425,22 +473,25 @@ async def disk_prune(req: Request):
 
 # ---------- routing ----------
 ROUTER = {"kolors-virtual-try-on": h_vton, "fashn/tryon": h_vton, "tryon": h_vton, "idm": h_vton, "catvton": h_vton,
-    "flux-pro/kontext": h_kontext, "kontext": h_kontext, "clarity-upscaler": h_upscale, "upscaler": h_upscale,
+    "flux-pro/kontext": h_kontext, "kontext": h_kontext, "qwen-image-edit": h_kontext, "image-edit": h_kontext,
+    "clarity-upscaler": h_upscale, "upscaler": h_upscale,
     "image-to-video": h_video, "wan": h_video, "kling-video": h_video, "hailuo": h_video,
     "tts": h_tts, "elevenlabs": h_tts, "vision": h_vision, "any-llm": h_vision}
-WARM = {"bg": ("kontext", _load_kontext), "video": ("wan", _load_wan), "upscale": ("upscale", _load_upscaler),
-    "vision": ("qwen", _load_qwen), "voice": ("f5", _load_f5), "vton": ("vton", _load_vton)}
+WARM = {"bg": ("edit", _load_edit), "edit": ("edit", _load_edit), "video": ("wan", _load_wan),
+    "upscale": ("upscale", _load_upscaler), "vision": ("qwen", _load_qwen),
+    "voice": ("f5", _load_f5), "vton": ("vton", _load_vton)}
 
 @app.get("/health")
 def health():
     used = None
     if DEVICE == "cuda":
         free, total = torch.cuda.mem_get_info(); used = round((total - free) / 1e9, 1)
+    edit_repo = KONTEXT_MODEL if EDIT_MODEL != "qwen" else QWEN_EDIT_MODEL
     return {"ok": True, "device": DEVICE, "loaded": list(_CACHE.keys()), "profile": GPU_PROFILE,
         "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used, "ram": _ram_gb(),
         "version": "v13", "pinned": list(_PIN), "offload": FORCE_OFFLOAD,
-        "models": {"vision": VISION_MODEL, "bg": KONTEXT_MODEL, "video": WAN_MODEL,
-                   "video_key": WAN_MODEL_KEY, "vton": VTON_MODEL, "face_enhance": FACE_ENHANCE},
+        "models": {"vision": VISION_MODEL, "edit": EDIT_MODEL, "edit_repo": edit_repo,
+                   "video": WAN_MODEL, "video_key": WAN_MODEL_KEY, "vton": VTON_MODEL, "face_enhance": FACE_ENHANCE},
         "video_opts": {"model": WAN_MODEL_KEY, "fps": WAN_FPS, "offload": WAN_OFFLOAD,
                        "default_platform": DEFAULT_PLATFORM, "max_seconds": MAX_SECONDS,
                        "models_available": sorted(WAN_CFG), "platforms": sorted(set(PLATFORM))},
@@ -449,7 +500,7 @@ def health():
 @app.post("/warmup")
 async def warmup(req: Request):
     body = await req.json(); node = body.get("node", "")
-    if node not in WARM: return JSONResponse({"ok": False, "error": "warmup node: bg|video|upscale|vision|voice|vton"}, 400)
+    if node not in WARM: return JSONResponse({"ok": False, "error": "warmup node: bg|edit|video|upscale|vision|voice|vton"}, 400)
     name, loader = WARM[node]
     try:
         t0 = time.time(); _need(name, loader); el = round(time.time() - t0, 1)
