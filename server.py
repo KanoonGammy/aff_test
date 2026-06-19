@@ -1,4 +1,7 @@
-# server.py - Khanun affiliate inference (RunPod) - v6
+# server.py - Khanun affiliate inference (RunPod) - v9
+# v9: PIN โมเดลอ่านชุด (qwen/vision) ไว้ใน VRAM ไม่ให้เขี่ยออก (ใช้ทุกงาน) — เขี่ยตัวอื่นก่อนเสมอ
+# v8: cache หลายโมเดลใน VRAM พร้อมกัน (LRU · การ์ด 48GB) — ไม่ต้องโหลดซ้ำตอนสลับโหนด · VRAM ไม่พอ = เขี่ย LRU ออกเอง
+# v7: คืนผลเป็น base64 inline (รูป/วิดีโอ) → backend ไม่ต้องดึง /file ซ้ำ (แก้ download_failed/WinError 10060 ตอน Pod คืน URL ภายใน)
 # v6: (1) h_vton รับ key ของแอปจริง human_image_url/garment_image_url/model_image  (2) ใส่ทั้งโมเดลลง GPU (48GB การ์ด) เลิก cpu_offload = เร็ว+ใช้ GPU เต็ม  (3) warmup/infer บอกเวลา (วิ)
 # v5: video เปลี่ยนเป็น Wan2.2-TI2V-5B (เบา RAM ~16GB) แทน A14B ที่ OOM บน Pod 46GB RAM
 # v4: + CatVTON wrapper (h_vton ใส่ชุดจริง บน RunPod ฟรี) — clone repo + AutoMasker(densepose+schp) + pipeline
@@ -20,7 +23,7 @@ CAT_DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32   # CatVTON/SD-
 GPU_PROFILE = os.environ.get("GPU_PROFILE", "a100")
 CATVTON_DIR = os.path.join(MODELS_ROOT, "CatVTON_repo")
 
-app = FastAPI(title="Khanun Affiliate Inference v6")
+app = FastAPI(title="Khanun Affiliate Inference v9")
 
 def _safe(name):
     return "".join(c for c in (name or "") if c.isalnum() or c in "-_ ")[:40].strip().replace(" ", "_") or "job"
@@ -42,17 +45,42 @@ def _save_bytes(data, ext, ip, p="f"):
     return os.path.relpath(os.path.join(d, fn), OUT)
 def _url(req, rel):
     return str(req.base_url).rstrip("/") + "/file/" + rel.replace(os.sep, "/")
+def _img_uri(img):
+    # v7: คืนรูปเป็น data-URI (base64) → ส่งกลับใน JSON เลย backend ไม่ต้องดึง /file ซ้ำ
+    b = io.BytesIO(); img.save(b, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(b.getvalue()).decode("ascii")
+def _file_uri(path, mime):
+    # v7: คืนไฟล์ (เช่น mp4/wav) เป็น data-URI base64
+    data = open(path, "rb").read()
+    return "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))
 
-_L = {"name": None, "obj": None}
+# v8/v9: cache หลายโมเดลใน VRAM พร้อมกัน (การ์ด 48GB) — LRU · VRAM ไม่พอตอนโหลด = เขี่ยตัวที่ใช้น้อยสุดออก
+# v9: PIN โมเดลอ่านชุด (qwen) ไว้ไม่ให้เขี่ยออก เพราะใช้ทุกงาน (เขี่ยตัวอื่นก่อนเสมอ)
+from collections import OrderedDict
+_CACHE = OrderedDict()   # name -> obj
+_PIN = {"qwen"}          # โมเดลที่ pin ไว้ (vision อ่านชุด) — เขี่ยเป็นตัวสุดท้ายเมื่อจำเป็นจริง ๆ
 def _free():
-    _L["obj"] = None; _L["name"] = None; gc.collect()
+    _CACHE.clear(); gc.collect()
     if DEVICE == "cuda": torch.cuda.empty_cache()
+def _evict_lru():
+    # หาตัวที่ "ไม่ pin" เก่าสุดเขี่ยก่อน · ถ้าเหลือแต่ pinned ค่อยเขี่ย pinned
+    target = next((n for n in _CACHE if n not in _PIN), None) or next(iter(_CACHE), None)
+    if target is not None:
+        _CACHE.pop(target); print("[evict]", target, "(เปิดที่ให้โมเดลใหม่)", flush=True)
+        gc.collect()
+        if DEVICE == "cuda": torch.cuda.empty_cache()
 def _need(name, loader):
-    if _L["name"] != name:
-        _free(); print("[load]", name, flush=True); t0 = time.time()
-        _L["obj"] = loader(); _L["name"] = name
-        print("[load]", name, "done", round(time.time() - t0, 1), "s", flush=True)
-    return _L["obj"]
+    if name in _CACHE:
+        _CACHE.move_to_end(name); return _CACHE[name]     # มีใน VRAM แล้ว → ใช้เลย ไม่โหลดซ้ำ
+    while True:
+        try:
+            print("[load]", name, flush=True); t0 = time.time()
+            obj = loader()
+            print("[load]", name, "done", round(time.time() - t0, 1), "s", flush=True)
+            _CACHE[name] = obj; _CACHE.move_to_end(name); return obj
+        except torch.cuda.OutOfMemoryError:
+            if not _CACHE: raise                            # ไม่มีอะไรให้เขี่ยแล้ว = ใหญ่เกินจริง
+            print("[load]", name, "OOM → เขี่ยตัวเก่า", flush=True); _evict_lru()
 
 def _place(p):
     """การ์ด 48GB (RTX 6000 Ada/A40): ใส่ทั้งโมเดลลง GPU = เร็ว + ใช้ GPU เต็ม · VRAM ไม่พอ → fallback cpu_offload"""
@@ -127,7 +155,7 @@ def h_kontext(req, ip):
     imgs = ip.get("images") or ([ip["image_url"]] if ip.get("image_url") else [])
     out = _need("kontext", _load_kontext)(image=_decode(imgs[0]), prompt=ip.get("prompt", ""),
         guidance_scale=3.5, num_inference_steps=int(ip.get("steps", 28))).images[0]
-    return {"images": [{"url": _url(req, _save_img(out, ip, "kontext"))}]}
+    _save_img(out, ip, "kontext"); return {"images": [{"url": _img_uri(out)}]}
 def h_upscale(req, ip):
     img = _decode(ip["image_url"]); f = int(ip.get("upscale_factor", 2))
     try:
@@ -137,22 +165,23 @@ def h_upscale(req, ip):
     except Exception as e:
         print("[upscale -> lanczos]", str(e)[:120], flush=True)
         out = img.resize((img.width * f, img.height * f), Image.LANCZOS).filter(ImageFilter.UnsharpMask(2, 130))
-    return {"images": [{"url": _url(req, _save_img(out, ip, "hq"))}]}
+    _save_img(out, ip, "hq"); return {"images": [{"url": _img_uri(out)}]}
 def h_video(req, ip):
     src = _decode(ip.get("image") or ip.get("image_url")); secs = int(float(ip.get("duration", 10)))
     nframes = min(secs, 5) * 16 + 1   # Wan ต้องการ 4n+1 เฟรม (16*วิ หาร 4 ลงตัว → +1)
     fr = _need("wan", _load_wan)(image=src, prompt=ip.get("prompt", ""),
         num_frames=nframes, num_inference_steps=int(ip.get("steps", 30))).frames[0]
     from diffusers.utils import export_to_video
-    d = _job_dir(ip); fn = "clip_%s.mp4" % uuid.uuid4().hex[:8]; export_to_video(fr, os.path.join(d, fn), fps=16)
-    return {"video": {"url": _url(req, os.path.relpath(os.path.join(d, fn), OUT))}}
+    d = _job_dir(ip); fp = os.path.join(d, "clip_%s.mp4" % uuid.uuid4().hex[:8]); export_to_video(fr, fp, fps=16)
+    return {"video": {"url": _file_uri(fp, "video/mp4")}}
 def h_tts(req, ip):
     dd = ip.get("inputs", ip)
     wav, sr, _ = _need("f5", _load_f5).infer(ref_file=os.environ.get("F5_REF_AUDIO", os.path.join(PERSIST, "voice/ref.wav")),
         ref_text=os.environ.get("F5_REF_TEXT", ""), gen_text=dd.get("text", ""))
     import soundfile as sf
     b = io.BytesIO(); sf.write(b, wav, sr, format="WAV")
-    return {"audio_url": _url(req, _save_bytes(b.getvalue(), "wav", ip, "vo"))}
+    _save_bytes(b.getvalue(), "wav", ip, "vo")
+    return {"audio_url": "data:audio/wav;base64," + base64.b64encode(b.getvalue()).decode("ascii")}
 def h_vision(req, ip):
     img = _decode(ip.get("image_url") or (ip.get("image_urls") or [""])[0])
     m, pr = _need("qwen", _load_qwen)
@@ -183,7 +212,7 @@ def h_vton(req, ip):
                num_inference_steps=int(ip.get("steps", 50)),
                guidance_scale=float(ip.get("guidance", 2.5)),
                height=H, width=W, generator=gen)[0]
-    return {"images": [{"url": _url(req, _save_img(out, ip, "tryon"))}]}
+    _save_img(out, ip, "tryon"); return {"images": [{"url": _img_uri(out)}]}
 
 ROUTER = {"kolors-virtual-try-on": h_vton, "fashn/tryon": h_vton, "tryon": h_vton, "idm": h_vton, "catvton": h_vton,
     "flux-pro/kontext": h_kontext, "kontext": h_kontext, "clarity-upscaler": h_upscale, "upscaler": h_upscale,
@@ -197,9 +226,9 @@ def health():
     used = None
     if DEVICE == "cuda":
         free, total = torch.cuda.mem_get_info(); used = round((total - free) / 1e9, 1)
-    return {"ok": True, "device": DEVICE, "loaded": _L["name"], "profile": GPU_PROFILE,
+    return {"ok": True, "device": DEVICE, "loaded": list(_CACHE.keys()), "profile": GPU_PROFILE,
         "gpu": torch.cuda.get_device_name(0) if DEVICE == "cuda" else None, "vram_used_gb": used,
-        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v6"}
+        "persist": PERSIST, "models_root": MODELS_ROOT, "out": OUT, "version": "v9", "pinned": list(_PIN)}
 
 @app.post("/warmup")
 async def warmup(req: Request):
