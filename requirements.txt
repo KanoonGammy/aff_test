@@ -1,18 +1,28 @@
 # ============================================================================
 # requirements.txt — Khanun Affiliate Inference server v13
 # ============================================================================
-# ⚠️ ติดตั้งหลักด้วย:  pip install -r requirements.txt
+# 🚀 ลงครบลำดับถูกในคำสั่งเดียว:  bash setup_pod.sh   (แนะนำ — กัน torch ผิดเวอร์ชัน)
+# หรือลงมือเอง:  pip install -r requirements.txt   แล้วทำ "ของที่ใส่ในไฟล์นี้ไม่ได้" ด้านล่าง
 #
-# ❌ ของพวกนี้ใส่ในไฟล์นี้ไม่ได้ (ต้องรันมือ — ดู RUNBOOK ส่วน C):
-#   1) torch/torchvision (ต้องระบุ CUDA index-url):
+# ❌ ของพวกนี้ใส่ในไฟล์ requirements ไม่ได้ (ต้องรันมือ — setup_pod.sh ทำให้ครบแล้ว):
+#
+#   1) ★★ torch/torchvision — ต้องลง "เป็นขั้นสุดท้าย" + ระบุ CUDA index-url
+#      (เพราะ basicsr/realesrgan/gfpgan/f5-tts ดึง torchvision ตัวอื่นมาทับ → เจอ
+#       "operator torchvision::nms does not exist" / "infer_schema Parameter q")
+#        pip uninstall -y torch torchvision
 #        pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
-#   2) detectron2 (ติดตั้งจาก git — สำหรับ CatVTON/IDM DensePose):
+#      verify (ต้องได้ nms ok True):
+#        python -c "import torch,torchvision; from torchvision.ops import nms; print(torch.__version__, torchvision.__version__,'nms ok', torch.cuda.is_available())"
+#
+#   2) detectron2 (CatVTON/IDM DensePose):
 #        pip install 'git+https://github.com/facebookresearch/detectron2.git'
-#   3) แพ็กเกจระบบ (apt — ไม่ใช่ pip):
-#        apt-get update && apt-get install -y ffmpeg libgl1 libglib2.0-0
-#   4) IDM-VTON manual: โค้ด repo (server clone ให้เอง git.io/yisol/IDM-VTON) + น้ำหนัก yisol/IDM-VTON (HF)
-#        - inference (h_vton_idm) ยังเป็นโครง → ใช้ VTON_MODEL=catvton ไปก่อน แล้วแจ้งให้เขียนต่อ
-#   5) HF token (สำหรับ FLUX gated):  export HF_TOKEN=hf_xxxx
+#   3) แพ็กเกจระบบ (apt):  apt-get update && apt-get install -y ffmpeg libgl1 libglib2.0-0
+#   4) IDM-VTON manual: server clone repo ให้เอง + น้ำหนัก yisol/IDM-VTON (HF) ·
+#        inference (h_vton_idm) ยังเป็นโครง → ใช้ VTON_MODEL=catvton ไปก่อน
+#   5) HF token (FLUX gated):  export HF_TOKEN=hf_xxxx
+#   6) (เฉพาะถ้าใช้ EDIT_MODEL=qwen) Qwen-Image-Edit-2511 ต้อง diffusers "ล่าสุด" (ใหม่กว่า 0.38):
+#        pip install -U "git+https://github.com/huggingface/diffusers"   # ⚠️ อาจกระทบ CatVTON (pin 0.38) — ทดสอบบน Pod
+#        (default EDIT_MODEL=kontext ใช้ diffusers 0.38.0 ได้ปกติ ไม่ต้องทำข้อนี้)
 # ============================================================================
 
 # ---- web server ----
@@ -24,6 +34,7 @@ python-multipart
 diffusers==0.38.0
 transformers>=4.49.0          # ★ Qwen2.5-VL ต้องการ >=4.49 (เก่ากว่านี้ server จะ fallback Qwen2-VL)
 accelerate
+bitsandbytes                  # quant 8bit/4bit สำหรับ EDIT_MODEL=qwen (Qwen-Image-Edit ให้ลง 48GB)
 safetensors
 sentencepiece
 protobuf
